@@ -4,19 +4,29 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import tempfile
+from io import BytesIO
 from pathlib import Path
 
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, send_file
 
+from checker.converter import (
+    build_conversion_zip,
+    run_conversion,
+)
 from checker.engine import CheckResult, run_check
 from checker.errors import CheckError
 from checker.manifest import parse_manifest
 
 ROOT = Path(__file__).resolve().parent
 SAMPLE_DIR = ROOT / "sample"
+CONVERT_SAMPLE_DIR = ROOT / "sample-convert"
 SAMPLE_TICKETS = "4242, 1003, 4218, 8888, 9999"
 SAMPLE_TICKET_COLUMN = "ticket_no"
+SAMPLE_TICKET_FIELD_ID = "10"
+SAMPLE_CHANNEL_FIELD_ID = "11"
+DEFAULT_BATCH_SIZE = 10_000
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = (
@@ -67,10 +77,35 @@ def _save_uploads(file_storages, temp_dir: Path) -> dict[str, Path]:
     return uploaded
 
 
+def _parse_field_id(raw: str, label: str) -> int:
+    text = (raw or "").strip()
+    if not re.fullmatch(r"[+-]?\d+", text):
+        raise CheckError(f"{label}字段 ID “{raw}” 不是整数。")
+    return int(text)
+
+
+def _parse_batch_size(raw: str) -> int:
+    text = (raw or "").strip()
+    if not text:
+        return DEFAULT_BATCH_SIZE
+    if not re.fullmatch(r"\d+", text) or int(text) <= 0:
+        raise CheckError(f"批大小 “{raw}” 必须是正整数。")
+    return int(text)
+
+
 def _sample_uploaded_paths(manifest) -> dict[str, Path]:
     paths: dict[str, Path] = {}
     for entry in manifest.required_entries:
         candidate = SAMPLE_DIR / entry.uploaded_filename
+        if candidate.is_file():
+            paths[entry.uploaded_filename] = candidate
+    return paths
+
+
+def _convert_sample_uploaded_paths(manifest) -> dict[str, Path]:
+    paths: dict[str, Path] = {}
+    for entry in manifest.entries:
+        candidate = CONVERT_SAMPLE_DIR / entry.uploaded_filename
         if candidate.is_file():
             paths[entry.uploaded_filename] = candidate
     return paths
@@ -83,6 +118,12 @@ def _render(
     tickets_text: str = "",
     ticket_column: str = "ticket_no",
     source: str = "",
+    conversion=None,
+    conversion_error: CheckError | None = None,
+    conversion_source: str = "",
+    ticket_field_id: str = "",
+    channel_field_id: str = "",
+    batch_size: str = "",
     status: int = 200,
 ):
     return (
@@ -93,7 +134,15 @@ def _render(
             tickets_text=tickets_text,
             ticket_column=ticket_column,
             source=source,
+            conversion=conversion,
+            conversion_error=conversion_error,
+            conversion_source=conversion_source,
+            ticket_field_id=ticket_field_id,
+            channel_field_id=channel_field_id,
+            batch_size=batch_size,
             sample_tickets=SAMPLE_TICKETS,
+            sample_ticket_field_id=SAMPLE_TICKET_FIELD_ID,
+            sample_channel_field_id=SAMPLE_CHANNEL_FIELD_ID,
             max_upload_mb=app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024),
         ),
         status,
@@ -174,6 +223,145 @@ def check():
         tickets_text=tickets_text,
         ticket_column=ticket_column,
         source="upload",
+    )
+
+
+def _run_conversion_request(
+    manifest_bytes: bytes,
+    parquet_files,
+    ticket_field_id_raw: str,
+    channel_field_id_raw: str,
+    batch_size_raw: str,
+    *,
+    temp_dir: Path,
+):
+    ticket_field_id = _parse_field_id(ticket_field_id_raw, "票号")
+    channel_field_id = _parse_field_id(channel_field_id_raw, "售票渠道")
+    batch_size = _parse_batch_size(batch_size_raw)
+    manifest = parse_manifest(manifest_bytes)
+    uploaded_paths = _save_uploads(parquet_files, temp_dir)
+    result = run_conversion(
+        manifest,
+        uploaded_paths,
+        ticket_field_id,
+        channel_field_id,
+        temp_dir,
+        batch_size=batch_size,
+    )
+    zip_path = build_conversion_zip(
+        result, temp_dir / result.output_filename, temp_dir
+    )
+    return result, zip_path
+
+
+@app.get("/convert/sample")
+def convert_sample():
+    """Run the conversion on the bundled sample and show a summary page."""
+    try:
+        manifest = parse_manifest(
+            (CONVERT_SAMPLE_DIR / "manifest.csv").read_bytes()
+        )
+        with tempfile.TemporaryDirectory(prefix="iceberg-eq-convert-") as temp:
+            result = run_conversion(
+                manifest,
+                _convert_sample_uploaded_paths(manifest),
+                int(SAMPLE_TICKET_FIELD_ID),
+                int(SAMPLE_CHANNEL_FIELD_ID),
+                Path(temp),
+                batch_size=4,
+            )
+    except CheckError as exc:
+        return _render(
+            conversion_error=exc,
+            conversion_source="sample",
+            ticket_field_id=SAMPLE_TICKET_FIELD_ID,
+            channel_field_id=SAMPLE_CHANNEL_FIELD_ID,
+            status=400,
+        )
+    return _render(
+        conversion=result,
+        conversion_source="sample",
+        ticket_field_id=SAMPLE_TICKET_FIELD_ID,
+        channel_field_id=SAMPLE_CHANNEL_FIELD_ID,
+    )
+
+
+@app.get("/convert/sample.zip")
+def convert_sample_zip():
+    """Download the ZIP produced from the bundled conversion sample."""
+    temp = tempfile.mkdtemp(prefix="iceberg-eq-convert-zip-")
+    temp_path = Path(temp)
+    try:
+        manifest = parse_manifest(
+            (CONVERT_SAMPLE_DIR / "manifest.csv").read_bytes()
+        )
+        result = run_conversion(
+            manifest,
+            _convert_sample_uploaded_paths(manifest),
+            int(SAMPLE_TICKET_FIELD_ID),
+            int(SAMPLE_CHANNEL_FIELD_ID),
+            temp_path,
+            batch_size=4,
+        )
+        zip_path = build_conversion_zip(
+            result, temp_path / result.output_filename, temp_path
+        )
+    except CheckError:
+        shutil.rmtree(temp, ignore_errors=True)
+        raise
+    return send_file(
+        zip_path,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name="converted-position-delete.zip",
+    )
+
+
+@app.post("/convert")
+def convert():
+    manifest_file = request.files.get("manifest")
+    parquet_files = request.files.getlist("files")
+    ticket_field_id = request.form.get("ticket_field_id", "").strip()
+    channel_field_id = request.form.get("channel_field_id", "").strip()
+    batch_size = request.form.get("batch_size", "").strip()
+
+    if manifest_file is None or not manifest_file.filename:
+        return _render(
+            conversion_error=CheckError(
+                "请上传 Iceberg v2 有效文件清单（CSV 或 JSON）。"
+            ),
+            ticket_field_id=ticket_field_id,
+            channel_field_id=channel_field_id,
+            batch_size=batch_size,
+            status=400,
+        )
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="iceberg-eq-convert-") as temp:
+            _result, zip_path = _run_conversion_request(
+                manifest_file.read(),
+                parquet_files,
+                ticket_field_id,
+                channel_field_id,
+                batch_size,
+                temp_dir=Path(temp),
+            )
+            # Read the archive while the temporary directory still exists.
+            payload = zip_path.read_bytes()
+    except CheckError as exc:
+        return _render(
+            conversion_error=exc,
+            ticket_field_id=ticket_field_id,
+            channel_field_id=channel_field_id,
+            batch_size=batch_size,
+            status=400,
+        )
+
+    return send_file(
+        BytesIO(payload),
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name="converted-position-delete.zip",
     )
 
 

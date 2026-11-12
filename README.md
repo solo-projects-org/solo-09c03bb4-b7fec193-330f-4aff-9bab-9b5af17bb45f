@@ -4,6 +4,11 @@
 （positional delete）标记。网页接收有效文件清单和对应 Parquet 副本，输入整数
 票号，逐条给出原文件、从 0 起算的文件内行号、是否已删除以及命中的删除文件。
 
+网页还提供 **等值删除 → 位置删除转换入口**：批量退票若以（票号、售票渠道）
+等值删除（equality delete）落湖，核查页无法识别，可在本页转换成位置删除
+ZIP，再与原数据和已有位置删除副本一起交给核查页。
+
+
 ## 快速启动
 
 ```bash
@@ -96,6 +101,55 @@ JSON 也支持，顶层可以是数组，或包含 `files` / `entries` 数组的
   或任一文件打不开、行组读取失败，整次核对都会中止并明确列出文件名，不显示
   任何票号的部分结论。未出现在清单中的上传文件会被忽略并给出警告。
 
+## 等值删除 → 位置删除转换
+
+### 输入要求
+
+上传 **同一分区定义、同一航次日** 的一组文件：
+
+1. 与核对页同格式的 Iceberg v2 有效文件清单（CSV 或 JSON），其中恰好包含
+   **一个** `equality_delete` 条目；
+2. 清单中的 **全部数据 Parquet**；
+3. 唯一的 **等值删除 Parquet** 副本；
+4. 票号字段 ID 与售票渠道字段 ID（整数）。
+
+清单里已有的 `position_delete` 条目原样保留，不要求上传其 Parquet 副本；
+未出现在清单中的上传文件会被忽略并给出警告。
+
+### 键列绑定规则
+
+- 按 **Iceberg 字段 ID（Parquet `field_id` 元数据）** 在每个文件的顶层列中
+  找键列，不按列名匹配；
+- 每个字段 ID 必须在每个文件中 **唯一绑定** 到一个顶层 `int32` 或 `int64`
+  列。找不到、绑定到多列、类型不是 int32/int64，都会中止并指出文件名；
+- 售票渠道列允许跨文件 **异名**（如数据里叫 `sales_channel`，删除文件里叫
+  `channel_id`）；数据副本之间的票号列必须 **同名**；
+- 两个字段 ID 不能相同。
+
+### 匹配与序列号规则
+
+- 等值删除的一行键（票号、渠道）与数据行 **两个键值都相等** 才算命中，
+  采用 SQL 空值语义：**空值只与空值相等**；
+- 仅当等值删除文件的数据序列号 **严格大于** 数据文件的数据序列号时，才为
+  命中行写出位置删除；序列号相等或更小的数据文件整体跳过并在结果页说明；
+- 重复的等值删除行按去重后的键处理，同一数据行最多产生一条位置删除；
+- 写出的每条记录包含数据文件的 **原路径** 和从 0 起算的 **文件内行号**。
+
+### 分批与输出
+
+- 数据与等值删除都按固定批大小（默认 10000 行，可在表单覆盖）分批读取；
+  等值删除键落盘到请求临时目录中的 SQLite 库，**不在内存中攒整份数据或全部
+  撤销键**，转换结束后临时库自动删除；
+- 新位置删除 Parquet 为 `file_path`（字符串）+ `pos`（int64）两列，文件名由
+  等值删除文件名派生（`delete-eq-*` → `delete-pos-*`）；
+- 更新后的清单把该等值删除条目 **替换为 `position_delete` 条目，沿用原删除
+  序列号**，其他条目（路径、文件名、类型、序列号）一律不变；
+- 下载的 ZIP 内含新 Parquet 与 `manifest.csv`，可与原数据和已有位置删除
+  副本一同上传到核对页。即使没有任何命中，也会生成不含记录的空位置删除
+  文件并给出提示。
+- **全有或全无**：缺件、键列无法唯一绑定、任一文件读写失败都会中止，明确
+  列出文件名，不产出任何转换包。
+
 ## 内置样例
 
 `sample/` 中的演示数据由 `tools/make_sample.py` 生成：
@@ -115,6 +169,25 @@ JSON 也支持，顶层可以是数组，或包含 `files` / `entries` 数组的
 样例默认票号：`4242, 1003, 4218, 8888, 9999`。其中 1003 已删除，4218
 存在但未删除，9999 不存在。
 
+### 转换样例（`sample-convert/`）
+
+由 `tools/make_sample_convert.py` 生成，点网页上的 **“载入转换样例”** 运行：
+
+- 字段 ID `10` 是票号（数据副本列名均为 `ticket_no`），字段 ID `11` 是渠道：
+  数据文件里叫 `sales_channel` / `sale_channel`，等值删除文件里叫
+  `channel_id`——**渠道改名仍按字段 ID 匹配**；
+- 包含空渠道键，演示空值只与空值相等；
+- `data-cv-0003.parquet` 的数据序列号（12）与等值删除序列号（12）相同，
+  其中的同键票据 **不会新增删除记录**；
+- 等值删除里有一行重复键，去重后只产生一条位置删除；
+- 清单中已有的 `delete-pos-existing-0001.parquet` 位置删除条目原样保留。
+
+重新生成转换样例：
+
+```bash
+python3 tools/make_sample_convert.py
+```
+
 ## 本地开发与测试
 
 需要 Python 3.11+、Flask、PyArrow。
@@ -122,7 +195,7 @@ JSON 也支持，顶层可以是数组，或包含 `files` / `entries` 数组的
 ```bash
 python3 -m pip install -r requirements.txt
 python3 app.py                     # http://localhost:8000
-python3 -m pytest -q               # 36 个测试
+python3 -m pytest -q               # 64 个测试
 ```
 
 重新生成样例（会覆盖 `sample/` 下的 Parquet 和清单）：
@@ -134,17 +207,20 @@ python3 tools/make_sample.py
 ## 目录
 
 ```
-app.py                     Flask 路由、上传处理、票号解析
-checker/manifest.py        清单解析与校验
-checker/engine.py          PyArrow 行组跳读、行号计算、位置删除匹配
-checker/errors.py          CheckError（始终带文件名）
-templates/index.html       网页
-static/style.css           样式
-sample/                    内置样例（清单 + Parquet）
-tools/make_sample.py       样例生成脚本
-tests/                     pytest 测试
-Dockerfile                 容器镜像
-docker-compose.yml         启动配置
+app.py                        Flask 路由、上传处理、票号解析、转换 ZIP 下载
+checker/manifest.py           清单解析与校验
+checker/engine.py             PyArrow 行组跳读、行号计算、位置删除匹配
+checker/converter.py          等值删除→位置删除：字段 ID 绑定、分批流式转换
+checker/errors.py             CheckError（始终带文件名）
+templates/index.html          网页（核对页 + 转换入口）
+static/style.css              样式
+sample/                       核对内置样例（清单 + Parquet）
+sample-convert/               转换内置样例（含渠道异名、空值、同序列号场景）
+tools/make_sample.py          核对样例生成脚本
+tools/make_sample_convert.py  转换样例生成脚本
+tests/                        pytest 测试
+Dockerfile                    容器镜像
+docker-compose.yml            启动配置
 ```
 
 ## 已知边界

@@ -14,6 +14,7 @@ COPY checker ./checker
 COPY templates ./templates
 COPY static ./static
 COPY sample ./sample
+COPY sample-convert ./sample-convert
 
 RUN useradd --system --uid 10001 --create-home appuser \
     && chown -R appuser:appuser /app

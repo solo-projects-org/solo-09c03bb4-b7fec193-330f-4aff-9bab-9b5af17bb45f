@@ -12,11 +12,14 @@
     <div class="brand">
       <span class="mark" aria-hidden="true">⛴</span>
       <div>
-        <h1>渡轮结算 · 票号删除核对</h1>
-        <p>Iceberg v2 源快照 · 仅位置删除（positional deletes）</p>
+        <h1>渡轮结算 · 票号删除核对与转换</h1>
+        <p>Iceberg v2 源快照 · 位置删除（positional deletes）与等值删除转换（equality → positional）</p>
       </div>
     </div>
-    <a class="button ghost" href="{{ url_for('sample') }}">载入样例</a>
+    <div class="topbar-actions">
+      <a class="button ghost" href="{{ url_for('convert_sample') }}">载入转换样例</a>
+      <a class="button ghost" href="{{ url_for('sample') }}">载入核对样例</a>
+    </div>
   </div>
 </header>
 
@@ -271,6 +274,165 @@
   </section>
   {% endif %}
 
+  {% if conversion_error %}
+  <section class="alert" role="alert">
+    <h2>转换未完成</h2>
+    <p>{{ conversion_error.message }}</p>
+    {% if conversion_error.files %}
+    <p class="alert-files">涉及文件：</p>
+    <ul class="file-list">
+      {% for file in conversion_error.files %}<li class="mono">{{ file }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+    <p class="hint">为避免产出不可用的副本，本次没有生成任何转换包。</p>
+  </section>
+  {% endif %}
+
+  {% if conversion %}
+  <section class="summary convert-summary">
+    <div class="summary-title">
+      <div>
+        <h2>等值删除转换结果</h2>
+        <p class="subtle">
+          票号字段 ID <code>{{ conversion.ticket_field_id }}</code> ·
+          渠道字段 ID <code>{{ conversion.channel_field_id }}</code> ·
+          批大小 {{ conversion.batch_size }} 行
+          {% if conversion_source == 'sample' %} · <span class="badge sample">内置样例</span>{% endif %}
+        </p>
+      </div>
+      {% if conversion_source == 'sample' %}
+      <a class="button primary" href="{{ url_for('convert_sample_zip') }}">下载样例转换 ZIP</a>
+      {% endif %}
+    </div>
+    <div class="chips">
+      <span class="chip">等值删除读取 <b>{{ conversion.delete_rows_read }}</b> 行</span>
+      <span class="chip">去重后键 <b>{{ conversion.distinct_delete_keys }}</b> 个</span>
+      <span class="chip">重复行折叠 <b>{{ conversion.duplicate_delete_rows }}</b> 行</span>
+      <span class="chip danger"><b>{{ conversion.positional_rows_written }}</b> 条位置删除</span>
+    </div>
+
+    {% if conversion_source == 'sample' %}
+    <p class="notice">
+      数据副本的渠道列分别叫 <code>sales_channel</code> / <code>sale_channel</code>，
+      等值删除文件里叫 <code>channel_id</code>：列名不同，但字段 ID 都是
+      <code>{{ conversion.channel_field_id }}</code>，因此仍能匹配。
+      <code>data-cv-0003.parquet</code> 的数据序列号（12）与等值删除序列号（12）相同，
+      不满足“删除序列号严格大于数据序列号”，其中的同键票据不会新增删除记录；
+      重复的等值删除行也只产生一条位置删除。
+    </p>
+    {% endif %}
+
+    <div class="table-wrap convert-table">
+      <table class="manifest-table">
+        <thead>
+          <tr>
+            <th>数据文件</th>
+            <th>命中行数</th>
+            <th>渠道列名（按字段 ID 绑定）</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for entry in conversion.manifest.data_files %}
+          <tr>
+            <td class="mono">{{ entry.uploaded_filename }}<small>数据序列号 {{ entry.sequence_number }}</small></td>
+            <td class="row-index">{{ conversion.matched_data_rows.get(entry.uploaded_filename, 0) }}</td>
+            <td><code>{{ conversion.bound_channels.get(entry.uploaded_filename, '—') }}</code></td>
+          </tr>
+          {% endfor %}
+          <tr class="manifest-ignored">
+            <td class="mono">{{ conversion.equality_entry.uploaded_filename }}<small>等值删除 · 序列号 {{ conversion.equality_entry.sequence_number }}</small></td>
+            <td class="row-index">{{ conversion.delete_rows_read }}</td>
+            <td><code>{{ conversion.bound_channels.get(conversion.equality_entry.uploaded_filename, '—') }}</code></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    {% if conversion.skipped_data_files %}
+    <div class="ignored-box">
+      <h4>因序列号未严格小于而跳过的数据文件</h4>
+      <ul>
+        {% for skipped in conversion.skipped_data_files %}
+        <li>
+          <span class="mono">{{ skipped.entry.uploaded_filename }}</span>
+          <small>{{ skipped.reason }}</small>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    <div class="ignored-box ok-box">
+      <h4>转换包内容</h4>
+      <ul>
+        <li><code>{{ conversion.output_filename }}</code> —— 新位置删除 Parquet（file_path、pos 两列，沿用原删除序列号 {{ conversion.equality_entry.sequence_number }}）</li>
+        <li><code>{{ conversion.output_manifest_name }}</code> —— 等值删除条目已替换为 position_delete，其他条目不变</li>
+      </ul>
+    </div>
+    {% if conversion.warnings %}
+    <ul class="warnings">
+      {% for warning in conversion.warnings %}<li>{{ warning }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+  {% endif %}
+
+  <section class="card form-card convert-form-card">
+    <div class="card-head">
+      <h2>等值删除 → 位置删除转换</h2>
+      <p class="subtle">
+        上传同一分区定义、同一航次日的 Iceberg v2 CSV 清单、全部数据 Parquet
+        与唯一的等值删除 Parquet。输入票号与售票渠道的字段 ID，按 ID 绑定顶层
+        int32 / int64 列；渠道列可异名，数据副本的票号列同名。成功后下载含新
+        Parquet 与更新后清单的 ZIP，可与原数据和已有位置删除副本一起交给核对页。
+      </p>
+    </div>
+    <form method="post" action="{{ url_for('convert') }}" enctype="multipart/form-data">
+      <div class="form-grid">
+        <label class="field">
+          <span class="field-label">有效文件清单 <small>CSV 或 JSON</small></span>
+          <input type="file" name="manifest" accept=".csv,.json,text/csv,application/json" required>
+          <span class="field-hint">
+            须恰好包含一个 <code>equality_delete</code> 条目；<code>position_delete</code>
+            条目原样保留
+          </span>
+        </label>
+        <label class="field">
+          <span class="field-label">Parquet 副本 <small>全部数据文件 + 唯一等值删除</small></span>
+          <input type="file" name="files" accept=".parquet,application/octet-stream" multiple required>
+          <span class="field-hint">文件名必须与清单的 <code>uploaded_filename</code> 一致</span>
+        </label>
+      </div>
+      <div class="form-grid three">
+        <label class="field narrow">
+          <span class="field-label">票号字段 ID</span>
+          <input type="text" name="ticket_field_id" inputmode="numeric"
+                 value="{{ ticket_field_id or sample_ticket_field_id }}"
+                 placeholder="{{ sample_ticket_field_id }}">
+          <span class="field-hint">顶层 int32 / int64 列；各数据副本票号列同名</span>
+        </label>
+        <label class="field narrow">
+          <span class="field-label">售票渠道字段 ID</span>
+          <input type="text" name="channel_field_id" inputmode="numeric"
+                 value="{{ channel_field_id or sample_channel_field_id }}"
+                 placeholder="{{ sample_channel_field_id }}">
+          <span class="field-hint">顶层 int32 / int64 列；允许与票号列不同名、跨文件异名</span>
+        </label>
+        <label class="field narrow">
+          <span class="field-label">批大小（行）<small>可选</small></span>
+          <input type="text" name="batch_size" inputmode="numeric"
+                 value="{{ batch_size }}" placeholder="10000">
+          <span class="field-hint">分批读写，不在内存攒整份数据或撤销键</span>
+        </label>
+      </div>
+      <div class="form-actions">
+        <button class="button primary" type="submit">转换并下载 ZIP</button>
+        <a class="button ghost" href="{{ url_for('convert_sample') }}">载入内置转换样例（渠道改名仍匹配）</a>
+        <span class="subtle limit">空值只与空值相等；仅当删除序列号严格大于数据序列号时才写出位置删除</span>
+      </div>
+    </form>
+  </section>
+
   <section class="card form-card">
     <div class="card-head">
       <h2>上传并核对</h2>
@@ -325,7 +487,9 @@
     <p>
       位置删除匹配条件：删除记录的 <code>file_path</code> 等于原始路径、
       <code>pos</code> 等于从 0 起算的文件内行号，且删除文件的数据序列号不小于数据文件。
-      缺失副本或任一读取失败都会中止整次核对。
+      等值删除转换按字段 ID 绑定票号与渠道键，两键值都相等（空值只与空值相等）才匹配，
+      且仅当删除序列号严格大于数据序列号时才写出位置删除。缺件、键列无法唯一绑定或
+      读写失败都会中止，不产出转换包。
     </p>
   </div>
 </footer>
